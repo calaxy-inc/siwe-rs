@@ -22,7 +22,10 @@ use http::uri::{Authority, InvalidUri};
 use iri_string::types::UriString;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use sha3::{Digest, Keccak256};
-use std::convert::{TryFrom, TryInto};
+use std::{
+    convert::{TryFrom, TryInto},
+    iter::Peekable,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -82,13 +85,13 @@ pub struct Message {
     /// An RFC 3986 URI referring to the resource that is the subject of the signing (as in the subject of a claim).
     pub uri: UriString,
     /// The current version of the message, which MUST be 1 for this specification.
-    pub version: Version,
+    pub version: Option<Version>,
     /// The EIP-155 Chain ID to which the session is bound, and the network where Contract Accounts MUST be resolved.
     pub chain_id: u64,
     /// A randomized token typically chosen by the relying party and used to prevent replay attacks, at least 8 alphanumeric characters.
     pub nonce: String,
     /// The ISO 8601 datetime string of the current time.
-    pub issued_at: TimeStamp,
+    pub issued_at: Option<TimeStamp>,
     /// The ISO 8601 datetime string that, if present, indicates when the signed authentication message is no longer valid.
     pub expiration_time: Option<TimeStamp>,
     /// The ISO 8601 datetime string that, if present, indicates when the signed authentication message will become valid.
@@ -106,13 +109,17 @@ impl Display for Message {
         writeln!(f)?;
         if let Some(statement) = &self.statement {
             writeln!(f, "{}", statement)?;
+            writeln!(f)?;
         }
-        writeln!(f)?;
         writeln!(f, "{}{}", URI_TAG, &self.uri)?;
-        writeln!(f, "{}{}", VERSION_TAG, self.version as u64)?;
+        if let Some(version) = self.version {
+            writeln!(f, "{}{}", VERSION_TAG, version as u64)?;
+        }
         writeln!(f, "{}{}", CHAIN_TAG, &self.chain_id)?;
-        writeln!(f, "{}{}", NONCE_TAG, &self.nonce)?;
-        write!(f, "{}{}", IAT_TAG, &self.issued_at)?;
+        write!(f, "{}{}", NONCE_TAG, &self.nonce)?;
+        if let Some(iat) = &self.issued_at {
+            write!(f, "\n{}{}", IAT_TAG, iat)?;
+        }
         if let Some(exp) = &self.expiration_time {
             write!(f, "\n{}{}", EXP_TAG, &exp)?
         };
@@ -170,6 +177,23 @@ fn parse_line<S: FromStr<Err = E>, E: Into<ParseError>>(
     tagged(tag, line).and_then(|s| S::from_str(s).map_err(|e| e.into()))
 }
 
+fn parse_line_optional<'a, S: FromStr<Err = E>, E: Into<ParseError>>(
+    lines: &mut Peekable<impl Iterator<Item = &'a str>>,
+    tag: &'static str,
+) -> Result<Option<S>, ParseError> {
+    let expr = match tag_optional(tag, lines.peek().copied())? {
+        Some(exp) => S::from_str(exp).map_err(|e| e.into())?,
+
+        None => {
+            return Ok(None);
+        }
+    };
+
+    let _ = lines.next();
+
+    Ok(Some(expr))
+}
+
 fn tag_optional<'a>(
     tag: &'static str,
     line: Option<&'a str>,
@@ -183,7 +207,7 @@ fn tag_optional<'a>(
 impl FromStr for Message {
     type Err = ParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut lines = s.split('\n');
+        let mut lines = s.split('\n').peekable();
         let domain = lines
             .next()
             .and_then(|preamble| preamble.strip_suffix(PREAMBLE))
@@ -199,20 +223,39 @@ impl FromStr for Message {
             })
             .and_then(|a| <[u8; 20]>::from_hex(a).map_err(|e| e.into()))?;
 
-        // Skip the new line:
+        // skip the new line
         lines.next();
-        let statement = match lines.next() {
-            None => return Err(ParseError::Format("No lines found after address")),
-            Some("") => None,
-            Some(s) => {
-                lines.next();
-                Some(s.to_string())
+
+        let statement = match lines.peek() {
+            Some(line)
+                if line.contains(':')
+                    && line.splitn(2, ':').next().is_some_and(|s| !s.contains(' ')) =>
+            {
+                // there is no statement, this is a field line
+                None
+            }
+
+            Some(s) => Some(s.to_string()),
+
+            None => {
+                return Err(ParseError::Format("No lines found after address"));
             }
         };
 
+        if statement.is_some() {
+            lines.next();
+        }
+
+        // skip empty lines after a potentially missing statement
+        while lines.peek().is_some_and(|s| s.is_empty()) {
+            lines.next();
+        }
+
         let uri = parse_line(URI_TAG, lines.next())?;
-        let version = parse_line(VERSION_TAG, lines.next())?;
+        let version: Option<Version> = parse_line_optional(&mut lines, VERSION_TAG)?;
+
         let chain_id = parse_line(CHAIN_TAG, lines.next())?;
+
         let nonce = parse_line(NONCE_TAG, lines.next()).and_then(|nonce: String| {
             if nonce.len() < 8 {
                 Err(ParseError::Format("Nonce must be longer than 8 characters"))
@@ -220,7 +263,8 @@ impl FromStr for Message {
                 Ok(nonce)
             }
         })?;
-        let issued_at = tagged(IAT_TAG, lines.next())?.parse()?;
+
+        let issued_at: Option<TimeStamp> = parse_line_optional(&mut lines, IAT_TAG)?;
 
         let mut line = lines.next();
         let expiration_time = match tag_optional(EXP_TAG, line)? {
@@ -766,6 +810,19 @@ Resources:
     }
 
     #[tokio::test]
+    async fn parse_message_base_app() {
+        let message = r#"localhost wants you to sign in with your Ethereum account:
+0x5d15F53e45141A2f0530128dEAd31b0E7859FC47
+
+URI: http://localhost:5173
+Chain ID: 8453
+Nonce: 0x3295502c99d02d82b65584a7d781dd0026ca4643bf19c490b6d569dada0cf2b5"#;
+
+        assert!(Message::from_str(message).is_ok());
+        assert_eq!(message, &Message::from_str(message).unwrap().to_string());
+    }
+
+    #[tokio::test]
     async fn verification() {
         let message = Message::from_str(
             r#"localhost:4361 wants you to sign in with your Ethereum account:
@@ -839,13 +896,15 @@ Resources:
                 .get("statement")
                 .map(|s| s.as_str().unwrap().try_into().unwrap()),
             uri: fields["uri"].as_str().unwrap().try_into().unwrap(),
-            version: <Version as std::str::FromStr>::from_str(fields["version"].as_str().unwrap())
-                .unwrap(),
+            version: Some(
+                <Version as std::str::FromStr>::from_str(fields["version"].as_str().unwrap())
+                    .unwrap(),
+            ),
             chain_id: fields["chainId"].as_u64().unwrap(),
             nonce: fields["nonce"].as_str().unwrap().try_into().unwrap(),
-            issued_at: <TimeStamp as std::str::FromStr>::from_str(
+            issued_at: Some(<TimeStamp as std::str::FromStr>::from_str(
                 fields["issuedAt"].as_str().unwrap(),
-            )?,
+            )?),
             expiration_time: match fields.get("expirationTime") {
                 Some(e) => Some(<TimeStamp as std::str::FromStr>::from_str(
                     e.as_str().unwrap(),
